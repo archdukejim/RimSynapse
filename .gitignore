@@ -1,0 +1,5 @@
+node_modules/
+certificate.pfx
+config.json
+.DS_Store
+package-lock.json
