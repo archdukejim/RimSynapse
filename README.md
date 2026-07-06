@@ -1,85 +1,154 @@
-# 🧠 RimMind LM Studio Bridge
+# RimSynapse Bridge
 
-An elegant, secure, and robust HTTPS local bridge connecting the RimWorld mod **RimMind** (Core/Dialogue/Actions/Memory/Advisor) to local LLM backends like **LM Studio** and **Ollama**.
+A portable Python bridge server that provides two services for RimWorld modders:
 
-The bridge solves local LLM execution bottlenecks in RimWorld by introducing structured request queueing, auto-model mapping, C# response sanitization, and a premium glassmorphic dashboard for real-time monitoring and one-click integration.
+1. **A Living Database** — REST API backed by SQLite for tracking colony history, pawn identity, weighted memories, relationships, interactions, and narrative threads
+2. **A Local AI Proxy** — pass-through to LM Studio / Ollama so mods can make LLM calls without managing connections
 
----
+The bridge also provides **context assembly** — mods send a generic object reference (event type + pawn IDs + framing), and the bridge queries the database, filters by mod-configurable settings, and returns both structured JSON data and a ready-to-use prompt.
 
-## 📸 Dashboard Overview
-
-![Dashboard Overview](images/dashboard_overview.webp)
-
----
-
-## 🚀 Key Features
-
-* **🔒 Secure Local HTTPS**: Automatically generates a localhost SSL certificate trusted by Windows so browsers and mod clients establish secure connections with no warning prompts.
-* **⚡ Request Concurrency Control**: Implements a single-concurrency request queue. Local backends running on consumer GPUs are protected against parallel thread requests (e.g. dialogue events trigger sequentially, preventing GPU lockups).
-* **🤖 Auto-Model Mapping**: Scans your active model list in LM Studio and automatically redirects any incoming API completions to your loaded model, bypassing the need to copy-paste long model names.
-* **🧹 Response Sanitization**: Automatically strips markdown json decorators (` ```json ` wrappers) from the LLM outputs to guarantee they parse cleanly in RimWorld-Core's C# client.
-* **🔗 One-Click RimWorld Configuration**: Automatically detects Ludeon Studios' local appdata settings directory, locates the RimMindCoreMod XML file, and configures the endpoint and key parameters with a single click.
-* **📊 SSE Log Streaming**: Real-time event logging (prompts, completion times, token counts) streamed directly to the browser dashboard using Server-Sent Events.
+> **See [docs/DESIGN.md](docs/DESIGN.md) for the full design document** — architecture, database schema, API reference, and mod vision.
 
 ---
 
-## 🛠️ Getting Started (End-User Setup)
+## Quick Start (Windows)
 
-### Quick Start (Windows)
 1. Download and extract this repository.
-2. Double-click the **[launch.bat](launch.bat)** script.
-3. If this is the first run:
-   - It will automatically install dependencies (`npm install`).
-   - It will open a Windows PowerShell prompt to generate and register your localhost SSL certificate. Click **Yes** when Windows asks to trust the root certificate.
-4. The launcher will automatically start the backend and open the dashboard in your browser: `https://localhost:3000`.
+2. Double-click **[launch.bat](launch.bat)**.
+3. On first run it will:
+   - Download portable Python 3.12 (~15 MB, one-time)
+   - Install dependencies into a local `lib/` directory
+   - Generate a localhost SSL certificate (click **Yes** to trust it)
+4. The bridge starts on `https://localhost:3001` and opens the dashboard.
+
+**No prerequisites required.** No Python install, no Node.js, no admin rights.
 
 ---
 
-## 🎮 Linking with RimWorld
+## Linking with RimWorld
 
-### Method 1: The One-Click Way (Recommended)
-1. Make sure RimWorld is closed (or you will need to restart it afterwards).
-2. Open the bridge dashboard at `https://localhost:3000`.
-3. In the sidebar, look for the **RimWorld Link** panel.
-4. Click **Link Mod Settings** (or **Auto-Configure Settings**).
-5. The bridge will directly modify RimWorld's local config files to establish the connection!
+### One-Click (Recommended)
+1. Close RimWorld (or restart it after linking).
+2. Open the dashboard at `https://localhost:3001`.
+3. Click **Link Mod Settings** in the sidebar.
 
-![Dashboard Linked Status](images/dashboard_after_ping.png)
-
-### Method 2: Manual Configuration
-In RimWorld, open **Options → Mod Settings → RimMind-Core** and configure:
-* **API Endpoint**: `https://localhost:3000/v1`
-* **API Key**: `rimmind-bridge`
-* **Model Name**: Any text (e.g. `auto` — the bridge will map it to your active loaded model)
+### Manual Configuration
+In RimWorld mod settings, set:
+- **API Endpoint**: `https://localhost:3001/v1`
+- **API Key**: `rimsynapse-bridge`
+- **Model Name**: `auto` (bridge maps to your loaded model)
 
 ---
 
-## 🛠️ Architecture & Files
+## API Overview
+
+All endpoints accept and return JSON. Full reference in [docs/DESIGN.md](docs/DESIGN.md).
+
+### Data API
+
+| Group | Endpoints | Description |
+|-------|-----------|-------------|
+| Colony | `POST /api/colony/register`, `GET /api/colony/{id}` | Register and query colony saves |
+| Pawns | `POST /api/pawn/register`, `GET /api/pawn/{id}`, `GET /api/pawns?colony_id=X` | Pawn identity with traits and skills |
+| Memory | `POST /api/memory/store`, `GET /api/memory/query`, `POST /api/memory/bump`, `POST /api/memory/decay` | Weighted event history |
+| Relationships | `POST /api/relationship/update`, `GET /api/relationship/query`, `POST /api/relationship/sample` | Pawn-to-pawn with integral tracking |
+| Interactions | `POST /api/interaction/store`, `POST /api/interaction/message`, `GET /api/interaction/{id}` | Conversation records |
+| Threads | `POST /api/thread/store`, `GET /api/threads?colony_id=X`, `POST /api/thread/bump`, `POST /api/thread/resolve` | Narrative keyword connections |
+
+### Context Assembly
 
 ```
-rimmind-lmstudio-bridge/
-├── server.js              # Express HTTPS proxy server & auto-linker API
-├── package.json           # Dependencies & scripts
-├── launch.bat             # Auto-installer & launcher (double-click)
-├── setup-certs.ps1        # Local SSL certificate generator
-├── certificate.pfx        # Generated PFX certificate (git-ignored)
-├── config.json            # Persisted runtime settings (git-ignored)
-├── images/                # Dashboard media assets
+POST /api/context/build
+{
+    "colony_id": 1,
+    "event_type": "relationship",
+    "source_pawn": "Thing_Human_1",
+    "target_pawn": "Thing_Human_2",
+    "framing": "They argued over food rations after a raid",
+    "settings": { "include_memories": true, "memory_limit": 5 }
+}
+```
+
+Returns both structured data and a generated prompt ready for LLM submission.
+
+### Schema Extension
+
+Mods can register their own database tables at runtime:
+
+```
+POST /api/schema/register
+{
+    "mod_id": "my_mod_factions",
+    "version": 1,
+    "tables": ["CREATE TABLE IF NOT EXISTS factions (...)"]
+}
+```
+
+### LLM Proxy
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /v1/models` | List loaded models (OpenAI-compatible) |
+| `POST /v1/chat/completions` | Forward chat completion to LM Studio / Ollama |
+
+---
+
+## Architecture
+
+```
++------------------+   JSON    +------------------+  proxy   +----------+
+|  Any RimWorld    | --------> |  RimSynapse      | -------> | LM Studio|
+|  Mod (C#)        |           |  Bridge (Python)  |          | / Ollama |
+|                  | <-------- |                  | <------- | (Local)  |
+|  - Queries DB    |  response |  - REST API      |  LLM out +----------+
+|  - Builds prompt |           |  - SQLite DB     |
+|  - Parses output |           |  - LLM proxy     |
+|  - Writes back   |           |  - Weight decay   |
++------------------+           +------------------+
+```
+
+## Project Structure
+
+```
+rimsynapse/
+├── server.py              # Flask server — LLM proxy + API endpoints
+├── database.py            # SQLite living database (12 core tables)
+├── requirements.txt       # Python dependencies
+├── launch.bat             # Portable launcher (auto-downloads Python)
+├── setup-certs.ps1        # SSL certificate generator
+├── config.json            # Runtime settings (git-ignored)
+├── data/                  # SQLite database files (git-ignored)
+├── docs/
+│   └── DESIGN.md          # Full design document
 └── public/
-    ├── index.html         # Dashboard HTML layout
-    ├── style.css          # Glassmorphic cosmic styling
-    └── app.js             # SSE & UI configuration scripting
+    ├── index.html         # Dashboard
+    ├── style.css          # Dashboard styling
+    └── app.js             # Dashboard scripting
 ```
 
 ---
 
-## ❓ Troubleshooting
+## Database
 
-### Connection to LM Studio is Offline
-- Make sure LM Studio is running.
-- Ensure the **Local Server** option is enabled inside LM Studio (usually listening on port `1234`).
-- If you have authentication enabled in LM Studio, enter your API key in the **LM Studio API Key** field on the bridge dashboard.
+The bridge uses a self-initializing SQLite database with 12 core tables:
 
-### Dashboard shows Certificate Warning
-- If the browser displays a warning, the root certificate was not trusted during setup.
-- Run `npm run setup-certs` again in the console and ensure you click **Yes** to trust the certificate.
+- **Identity**: `colonies`, `pawns`, `pawn_traits`, `pawn_skills`
+- **Memory**: `memories`, `relationships`, `opinion_samples`
+- **Interactions**: `interactions`, `interaction_messages`, `narrative_threads`
+- **Operational**: `prompt_log`, `schema_registry`
+
+On every startup, the bridge verifies all tables exist and runs any pending schema migrations automatically. Mods can extend the schema at runtime via the extension API.
+
+---
+
+## Troubleshooting
+
+**LM Studio connection offline**
+- Ensure LM Studio is running with Local Server enabled (default port 1234)
+- If authentication is enabled, enter your API key in the dashboard
+
+**Certificate warning in browser**
+- Run `setup-certs.ps1` again and click **Yes** to trust the certificate
+
+**Database issues**
+- Delete `data/rimsynapse.db` to reset — the bridge will recreate it on next launch
