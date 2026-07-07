@@ -1,203 +1,345 @@
 """
-RimSynapse Context Assembly — Stateless Prompt Builder
-Receives a full game-state packet from the C# mod, filters by settings,
-and returns structured data + a ready-to-use prompt.
+RimSynapse Prompt Engine — Template Registry + Raw Pass-through
 
-No database, no state. Pure data transformation.
+Two modes for mod developers:
+1. TEMPLATE MODE (efficient): Register a template once, fill slots at runtime
+2. RAW MODE (flexible): Send the full prompt/context each time
+
+Both return a ready-to-use prompt for the LLM proxy.
 """
+import re
+from typing import Optional
 
 
-def build_context(data: dict) -> dict:
+# In-memory template registry: { template_id: TemplateRecord }
+_templates = {}
+
+
+class TemplateRecord:
+    """A registered prompt template with weighted slots."""
+
+    def __init__(self, mod_id: str, template_id: str, template: str,
+                 slots: dict, max_tokens: Optional[int] = None,
+                 description: str = ""):
+        self.mod_id = mod_id
+        self.template_id = template_id
+        self.template = template          # Template string with {{slot_name}} placeholders
+        self.slots = slots                # { slot_name: { weight, required, default, type } }
+        self.max_tokens = max_tokens      # Optional token budget
+        self.description = description
+        self.fill_count = 0               # How many times this template has been used
+
+    def to_dict(self):
+        return {
+            "mod_id": self.mod_id,
+            "template_id": self.template_id,
+            "template": self.template,
+            "slots": self.slots,
+            "max_tokens": self.max_tokens,
+            "description": self.description,
+            "fill_count": self.fill_count,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Template Registration
+# ---------------------------------------------------------------------------
+
+def register_template(data: dict) -> dict:
     """
-    Assemble context from a game-state packet.
+    Register a prompt template with weighted slots.
 
-    The mod sends event_type, pawn data, colony info, and framing.
-    The bridge filters by settings and returns both structured data
-    and an assembled prompt.
+    Args:
+        data: {
+            "mod_id": "rimsynapse",
+            "template_id": "relationship_dialogue",
+            "template": "You are {{pawn_name}}, a {{traits}} colonist...",
+            "slots": {
+                "pawn_name": { "weight": 10, "required": true },
+                "traits":    { "weight": 8 },
+                ...
+            },
+            "max_tokens": 200,       # optional
+            "description": "..."     # optional
+        }
+
+    Returns: { "status": "registered", "template_id": "...", ... }
     """
-    settings = data.get("settings", {})
-    weight_threshold = settings.get("weight_threshold", 0.1)
-    memory_limit = settings.get("memory_limit", 5)
+    mod_id = data.get("mod_id", "unknown")
+    template_id = data.get("template_id")
+    if not template_id:
+        return {"error": "template_id is required"}
 
-    result = {
-        "data": {},
-        "prompt": "",
-        "tokens_estimated": 0,
-        "memories_included": 0,
-        "threads_included": 0,
-        "filtered_out": {
-            "memories_below_threshold": 0,
-            "memories_over_limit": 0,
-        },
+    template_str = data.get("template", "")
+    if not template_str:
+        return {"error": "template is required"}
+
+    slots = data.get("slots", {})
+
+    # Normalize slot definitions
+    normalized_slots = {}
+    for name, config in slots.items():
+        if isinstance(config, dict):
+            normalized_slots[name] = {
+                "weight": config.get("weight", 5),
+                "required": config.get("required", False),
+                "default": config.get("default", ""),
+                "type": config.get("type", "string"),
+            }
+        else:
+            # Simple weight-only definition: "pawn_name": 10
+            normalized_slots[name] = {
+                "weight": config if isinstance(config, (int, float)) else 5,
+                "required": False,
+                "default": "",
+                "type": "string",
+            }
+
+    # Check that all template placeholders have slot definitions
+    placeholders = set(re.findall(r'\{\{(\w+)\}\}', template_str))
+    undefined = placeholders - set(normalized_slots.keys())
+    if undefined:
+        # Auto-register undefined slots with default weight
+        for name in undefined:
+            normalized_slots[name] = {
+                "weight": 5,
+                "required": False,
+                "default": "",
+                "type": "string",
+            }
+
+    record = TemplateRecord(
+        mod_id=mod_id,
+        template_id=template_id,
+        template=template_str,
+        slots=normalized_slots,
+        max_tokens=data.get("max_tokens"),
+        description=data.get("description", ""),
+    )
+
+    is_update = template_id in _templates
+    _templates[template_id] = record
+
+    return {
+        "status": "updated" if is_update else "registered",
+        "template_id": template_id,
+        "mod_id": mod_id,
+        "slot_count": len(normalized_slots),
+        "placeholders": sorted(placeholders),
     }
 
-    # Colony
-    colony = data.get("colony")
-    if colony and settings.get("include_colony", True):
-        result["data"]["colony"] = colony
 
-    # Source pawn
-    source_pawn = data.get("source_pawn")
-    if source_pawn:
-        filtered = _filter_pawn(source_pawn, settings, weight_threshold, memory_limit, result)
-        result["data"]["source_pawn"] = filtered
-
-    # Target pawn
-    target_pawn = data.get("target_pawn")
-    if target_pawn:
-        filtered = _filter_pawn(target_pawn, settings, weight_threshold, memory_limit, result)
-        result["data"]["target_pawn"] = filtered
-
-    # Narrative threads
-    threads = data.get("narrative_threads", [])
-    if settings.get("include_threads", True) and threads:
-        filtered_threads = [t for t in threads if t.get("weight", 0) >= weight_threshold]
-        result["data"]["active_threads"] = filtered_threads
-        result["threads_included"] = len(filtered_threads)
-
-    # Build prompt
-    framing = data.get("framing", "")
-    event_type = data.get("event_type", "general")
-    result["prompt"] = _build_prompt(event_type, framing, result["data"])
-    result["tokens_estimated"] = len(result["prompt"]) // 4
-
-    return result
+def list_templates() -> list:
+    """List all registered templates."""
+    return [t.to_dict() for t in _templates.values()]
 
 
-def _filter_pawn(pawn: dict, settings: dict, weight_threshold: float,
-                 memory_limit: int, result: dict) -> dict:
-    """Filter a pawn's data based on mod settings."""
-    ctx = {"name": pawn.get("name", "Unknown")}
-
-    # Pass through identity fields
-    for field in ("pawn_id", "gender", "age", "ideology", "xenotype", "title"):
-        if pawn.get(field):
-            ctx[field] = pawn[field]
-
-    # Traits
-    if settings.get("include_traits", True) and pawn.get("traits"):
-        ctx["traits"] = pawn["traits"]
-
-    # Backstory
-    if settings.get("include_backstory", True) and pawn.get("backstory"):
-        ctx["backstory"] = pawn["backstory"]
-
-    # Skills
-    if settings.get("include_skills", False) and pawn.get("skills"):
-        ctx["skills"] = pawn["skills"]
-
-    # Needs
-    if settings.get("include_needs", False) and pawn.get("needs"):
-        ctx["needs"] = pawn["needs"]
-
-    # Memories — filter by weight threshold, then cap at limit
-    if settings.get("include_memories", True) and pawn.get("memories"):
-        all_memories = pawn["memories"]
-        above_threshold = [m for m in all_memories if m.get("weight", 0) >= weight_threshold]
-        below_threshold = len(all_memories) - len(above_threshold)
-
-        # Sort by weight descending, cap at limit
-        above_threshold.sort(key=lambda m: m.get("weight", 0), reverse=True)
-        over_limit = max(0, len(above_threshold) - memory_limit)
-        capped = above_threshold[:memory_limit]
-
-        ctx["memories"] = capped
-        result["memories_included"] += len(capped)
-        result["filtered_out"]["memories_below_threshold"] += below_threshold
-        result["filtered_out"]["memories_over_limit"] += over_limit
-
-    # Relationships
-    if settings.get("include_relationships", True) and pawn.get("relationships"):
-        ctx["relationships"] = pawn["relationships"]
-
-    return ctx
+def get_template(template_id: str) -> Optional[dict]:
+    """Get a single template by ID."""
+    t = _templates.get(template_id)
+    return t.to_dict() if t else None
 
 
-def _build_prompt(event_type: str, framing: str, data: dict) -> str:
-    """Build a prompt string from assembled context data."""
-    parts = []
+def unregister_template(template_id: str) -> dict:
+    """Remove a registered template."""
+    if template_id in _templates:
+        del _templates[template_id]
+        return {"status": "removed", "template_id": template_id}
+    return {"error": "template not found", "template_id": template_id}
 
-    # Source pawn identity
-    source = data.get("source_pawn")
-    if source:
-        name = source.get("name", "Unknown")
-        traits = source.get("traits", [])
-        trait_str = ", ".join(traits) if isinstance(traits, list) else str(traits)
-        parts.append(f"You are {name}" + (f", a {trait_str} colonist" if traits else "") + ".")
 
-        backstory = source.get("backstory")
-        if backstory:
-            parts.append(f"Background: {backstory}.")
+# ---------------------------------------------------------------------------
+# Prompt Fill (Template Mode)
+# ---------------------------------------------------------------------------
 
-    # Framing / situation
-    if framing:
-        parts.append(f"\nSituation: {framing}")
+def fill_template(data: dict) -> dict:
+    """
+    Fill a registered template with slot values.
 
-    # Target pawn
-    target = data.get("target_pawn")
-    if target:
-        target_name = target.get("name", "Unknown")
-        target_traits = target.get("traits", [])
-        trait_str = ", ".join(target_traits) if isinstance(target_traits, list) else str(target_traits)
-        parts.append(f"\n{target_name}" + (f" ({trait_str})" if target_traits else "") + ":")
+    Args:
+        data: {
+            "template_id": "relationship_dialogue",
+            "slots": {
+                "pawn_name": "Fred",
+                "traits": "Greedy, Tough",
+                "event": "argued about food rations",
+            },
+            "max_tokens": 150  # optional override
+        }
 
-        # Relationship between source and target
-        if source and source.get("relationships"):
-            for rel in source["relationships"]:
-                rel_with = rel.get("with", "")
-                if rel_with == target_name:
-                    opinion = rel.get("opinion", 0)
-                    integral = rel.get("integral", 0)
-                    rel_type = rel.get("type", "")
-                    parts.append(
-                        f"Your opinion of {target_name}: {opinion} "
-                        f"(deep sentiment: {integral})"
-                        + (f", {rel_type}" if rel_type else "")
-                    )
-                    break
-
-    # Source memories
-    if source and source.get("memories"):
-        parts.append("\nRecent memories:")
-        for m in source["memories"]:
-            summary = m.get("summary", "")
-            parts.append(f"- {summary}")
-
-    # Target memories
-    if target and target.get("memories"):
-        target_name = target.get("name", "Unknown")
-        parts.append(f"\n{target_name}'s recent memories:")
-        for m in target["memories"]:
-            parts.append(f"- {m.get('summary', '')}")
-
-    # Narrative threads
-    threads = data.get("active_threads", [])
-    if threads:
-        parts.append("\nActive rumors/events in the world:")
-        for t in threads:
-            parts.append(f"- {t.get('description', t.get('keyword', ''))}")
-
-    # Colony
-    colony = data.get("colony")
-    if colony:
-        colony_info = f"\nColony: {colony.get('name', 'Unknown')}"
-        if colony.get("biome"):
-            colony_info += f" ({colony['biome']})"
-        if colony.get("pawn_count"):
-            colony_info += f", {colony['pawn_count']} colonists"
-        parts.append(colony_info)
-
-    # Instruction based on event type
-    instructions = {
-        "relationship": "Respond in character. Show how this relationship dynamic plays out.",
-        "dialogue": "Respond in character as this colonist.",
-        "reaction": "Describe this colonist's reaction to the situation.",
-        "event": "Generate a narrative event that fits this colony's current state.",
-        "quest": "Describe this quest-related interaction.",
-        "custom": framing,
+    Returns: {
+        "prompt": "You are Fred, a Greedy, Tough colonist...",
+        "template_id": "...",
+        "tokens_estimated": 42,
+        "slots_filled": ["pawn_name", "traits", "event"],
+        "slots_dropped": ["backstory"],
+        "slots_missing": []
     }
-    instruction = instructions.get(event_type, "Respond in character.")
-    if event_type != "custom":
-        parts.append(f"\n{instruction}")
+    """
+    template_id = data.get("template_id")
+    if not template_id:
+        return {"error": "template_id is required"}
 
-    return "\n".join(parts)
+    record = _templates.get(template_id)
+    if not record:
+        return {"error": f"Template '{template_id}' not found. Register it first via POST /api/template/register"}
+
+    slot_values = data.get("slots", {})
+    max_tokens = data.get("max_tokens") or record.max_tokens
+
+    # Check required slots
+    missing = []
+    for name, config in record.slots.items():
+        if config["required"] and name not in slot_values:
+            if config["default"]:
+                slot_values[name] = config["default"]
+            else:
+                missing.append(name)
+
+    if missing:
+        return {
+            "error": f"Missing required slots: {missing}",
+            "template_id": template_id,
+            "slots_missing": missing,
+        }
+
+    # Sort optional slots by weight (lowest first = drop first)
+    optional_slots = [
+        (name, config["weight"])
+        for name, config in record.slots.items()
+        if not config["required"] and name in slot_values
+    ]
+    optional_slots.sort(key=lambda x: x[1])  # lowest weight first
+
+    # Build the prompt — start with all slots filled
+    filled_slots = set()
+    dropped_slots = []
+
+    def _render(values: dict) -> str:
+        """Render the template with the given values."""
+        result = record.template
+        for name, value in values.items():
+            placeholder = "{{" + name + "}}"
+            if isinstance(value, list):
+                # Render arrays as bulleted list
+                rendered = "\n".join(f"- {item}" for item in value)
+            else:
+                rendered = str(value)
+            result = result.replace(placeholder, rendered)
+        # Clean up any unfilled optional placeholders
+        result = re.sub(r'\{\{\w+\}\}', '', result)
+        # Clean up empty lines left by removed placeholders
+        result = re.sub(r'\n\s*\n\s*\n', '\n\n', result)
+        return result.strip()
+
+    # First pass: render with everything
+    prompt = _render(slot_values)
+    filled_slots = set(slot_values.keys())
+    tokens_est = len(prompt) // 4
+
+    # If over budget, drop lowest-weight optional slots until it fits
+    if max_tokens and tokens_est > max_tokens:
+        working_values = dict(slot_values)
+        for name, weight in optional_slots:
+            if tokens_est <= max_tokens:
+                break
+            del working_values[name]
+            filled_slots.discard(name)
+            dropped_slots.append(name)
+            prompt = _render(working_values)
+            tokens_est = len(prompt) // 4
+
+    record.fill_count += 1
+
+    return {
+        "prompt": prompt,
+        "template_id": template_id,
+        "mod_id": record.mod_id,
+        "tokens_estimated": tokens_est,
+        "slots_filled": sorted(filled_slots),
+        "slots_dropped": dropped_slots,
+        "slots_missing": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Raw Prompt (Pass-through Mode)
+# ---------------------------------------------------------------------------
+
+def build_raw_prompt(data: dict) -> dict:
+    """
+    Raw mode: The mod sends the complete prompt or context packet.
+    The bridge just packages it for the LLM.
+
+    Accepts either:
+    - { "prompt": "full prompt text" }  — direct pass-through
+    - { "messages": [...] }             — chat format pass-through
+    - { "system": "...", "user": "..." } — simple system+user format
+
+    Returns: {
+        "prompt": "...",
+        "messages": [...],
+        "tokens_estimated": N,
+        "mode": "raw"
+    }
+    """
+    # Direct prompt text
+    if "prompt" in data:
+        prompt = data["prompt"]
+        return {
+            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
+            "tokens_estimated": len(prompt) // 4,
+            "mode": "raw",
+        }
+
+    # Chat messages format
+    if "messages" in data:
+        messages = data["messages"]
+        total_text = " ".join(m.get("content", "") for m in messages)
+        return {
+            "prompt": total_text,
+            "messages": messages,
+            "tokens_estimated": len(total_text) // 4,
+            "mode": "raw",
+        }
+
+    # Simple system + user format
+    system = data.get("system", "")
+    user = data.get("user", "")
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    if user:
+        messages.append({"role": "user", "content": user})
+
+    total_text = f"{system} {user}".strip()
+    return {
+        "prompt": total_text,
+        "messages": messages,
+        "tokens_estimated": len(total_text) // 4,
+        "mode": "raw",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Session Stats (for dashboard)
+# ---------------------------------------------------------------------------
+
+def get_engine_stats() -> dict:
+    """Return stats about the prompt engine for the dashboard."""
+    total_fills = sum(t.fill_count for t in _templates.values())
+    return {
+        "templates_registered": len(_templates),
+        "total_fills": total_fills,
+        "templates": [
+            {
+                "template_id": t.template_id,
+                "mod_id": t.mod_id,
+                "slot_count": len(t.slots),
+                "fill_count": t.fill_count,
+                "description": t.description,
+            }
+            for t in _templates.values()
+        ],
+    }

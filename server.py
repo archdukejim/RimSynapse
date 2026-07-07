@@ -29,7 +29,10 @@ from queue import Queue, Empty
 
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
-from context import build_context
+from context import (
+    register_template, list_templates, get_template, unregister_template,
+    fill_template, build_raw_prompt, get_engine_stats,
+)
 
 # ---------------------------------------------------------------------------
 # Paths & Constants
@@ -1545,70 +1548,115 @@ def load_ssl_context():
 
 
 # ---------------------------------------------------------------------------
-# Context Assembly & Dashboard Routes (Stateless)
+# Prompt Engine Routes (Dual Mode)
 # ---------------------------------------------------------------------------
 
-@app.route('/api/context/build', methods=['POST'])
-def api_context_build():
-    """Stateless context assembly. Receives full game-state packet, returns prompt."""
+# --- Template Management ---
+
+@app.route('/api/template/register', methods=['POST'])
+def api_template_register():
+    """Register or update a prompt template with weighted slots."""
     try:
         data = request.get_json()
-        result = build_context(data)
-
-        # Track session stats for dashboard
-        session_stats["context_calls"] += 1
-        session_stats["total_tokens_estimated"] += result.get("tokens_estimated", 0)
-        session_stats["total_memories_included"] += result.get("memories_included", 0)
-
-        # Track colony info
-        colony = data.get("colony")
-        if colony:
-            session_stats["last_colony"] = colony
-
-        # Track pawns seen
-        for key in ("source_pawn", "target_pawn"):
-            pawn = data.get(key)
-            if pawn and pawn.get("name"):
-                name = pawn["name"]
-                if name not in session_stats["last_pawns_seen"]:
-                    session_stats["last_pawns_seen"].append(name)
-                # Track memories
-                for m in pawn.get("memories", []):
-                    entry = {
-                        "pawn_name": name,
-                        "summary": m.get("summary", ""),
-                        "memory_type": m.get("type", m.get("memoryType", "event")),
-                        "weight": m.get("weight", 0),
-                    }
-                    session_stats["recent_memories"].insert(0, entry)
-                    session_stats["recent_memories"] = session_stats["recent_memories"][:50]
-
-        # Track threads
-        threads = data.get("narrative_threads", [])
-        if threads:
-            session_stats["recent_threads"] = threads
-
-        log_to_dashboard('info', 'context',
-            f"Context built: {result['memories_included']} memories, "
-            f"{result['threads_included']} threads, ~{result['tokens_estimated']} tokens")
+        result = register_template(data)
+        if "error" in result:
+            return jsonify(result), 400
+        log_to_dashboard('success', 'prompt',
+            f"Template registered: {result['template_id']} "
+            f"({result['slot_count']} slots) from {result.get('mod_id', '?')}")
         return jsonify(result)
     except Exception as e:
-        log_to_dashboard('error', 'context', f"Context build error: {e}")
+        log_to_dashboard('error', 'prompt', f"Template register error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
-# --- Dashboard Stats (from session memory, not a database) ---
+@app.route('/api/template/list', methods=['GET'])
+def api_template_list():
+    """List all registered templates."""
+    return jsonify(list_templates())
+
+
+@app.route('/api/template/<template_id>', methods=['GET'])
+def api_template_get(template_id):
+    """Get a specific template by ID."""
+    result = get_template(template_id)
+    if result:
+        return jsonify(result)
+    return jsonify({'error': f"Template '{template_id}' not found"}), 404
+
+
+@app.route('/api/template/<template_id>', methods=['DELETE'])
+def api_template_delete(template_id):
+    """Remove a registered template."""
+    result = unregister_template(template_id)
+    if "error" in result:
+        return jsonify(result), 404
+    log_to_dashboard('info', 'prompt', f"Template removed: {template_id}")
+    return jsonify(result)
+
+
+# --- Prompt Fill (Template Mode — efficient, cached) ---
+
+@app.route('/api/prompt/fill', methods=['POST'])
+def api_prompt_fill():
+    """Fill a registered template with slot values. Efficient for repeated calls."""
+    try:
+        data = request.get_json()
+        result = fill_template(data)
+        if "error" in result:
+            return jsonify(result), 400
+
+        # Track for dashboard
+        session_stats["context_calls"] += 1
+        session_stats["total_tokens_estimated"] += result.get("tokens_estimated", 0)
+
+        log_to_dashboard('info', 'prompt',
+            f"Template filled: {result['template_id']} -> "
+            f"~{result['tokens_estimated']} tokens, "
+            f"{len(result.get('slots_dropped', []))} slots dropped")
+        return jsonify(result)
+    except Exception as e:
+        log_to_dashboard('error', 'prompt', f"Template fill error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# --- Raw Prompt (Pass-through Mode — flexible, full packet) ---
+
+@app.route('/api/prompt/raw', methods=['POST'])
+def api_prompt_raw():
+    """Send a complete prompt or context packet. The bridge just packages it."""
+    try:
+        data = request.get_json()
+        result = build_raw_prompt(data)
+
+        # Track for dashboard
+        session_stats["context_calls"] += 1
+        session_stats["total_tokens_estimated"] += result.get("tokens_estimated", 0)
+
+        log_to_dashboard('info', 'prompt',
+            f"Raw prompt: ~{result['tokens_estimated']} tokens")
+        return jsonify(result)
+    except Exception as e:
+        log_to_dashboard('error', 'prompt', f"Raw prompt error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# --- Dashboard Stats ---
 
 @app.route('/api/database/stats', methods=['GET'])
 def api_dashboard_stats():
     """Session statistics for the dashboard."""
+    engine = get_engine_stats()
     colony = session_stats.get("last_colony", {})
     return jsonify({
         "schema_version": "stateless",
         "db_size_bytes": 0,
         "tables": {},
         "colonies": [colony] if colony else [],
-        "mods": [],
+        "mods": [
+            {"mod_id": t["mod_id"], "version": "-", "table_names": f"{t['slot_count']} slots"}
+            for t in engine.get("templates", [])
+        ],
         "weight_distribution": _compute_weight_dist(session_stats.get("recent_memories", [])),
         "thread_distribution": _compute_thread_dist(session_stats.get("recent_threads", [])),
         "totals": {
@@ -1619,12 +1667,13 @@ def api_dashboard_stats():
             "interactions": session_stats.get("context_calls", 0),
             "threads": len(session_stats.get("recent_threads", [])),
         },
+        "prompt_engine": engine,
     })
 
 
 @app.route('/api/database/memories/recent', methods=['GET'])
 def api_dashboard_recent_memories():
-    """Recent memories seen in context calls."""
+    """Recent memories seen in prompt calls."""
     limit = request.args.get('limit', 20, type=int)
     return jsonify(session_stats.get("recent_memories", [])[:limit])
 
@@ -1637,7 +1686,7 @@ def api_dashboard_pawns():
 
 @app.route('/api/database/threads', methods=['GET'])
 def api_dashboard_threads():
-    """Narrative threads from last context call."""
+    """Narrative threads from last prompt call."""
     return jsonify(session_stats.get("recent_threads", []))
 
 
@@ -1669,6 +1718,8 @@ def _compute_thread_dist(threads):
         else:
             dist["hot"] += 1
     return dist
+
+
 
 
 # ---------------------------------------------------------------------------
