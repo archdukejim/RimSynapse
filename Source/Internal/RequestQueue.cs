@@ -162,44 +162,32 @@ namespace RimSynapse.Internal
                         request.Options.model = model;
                     }
 
-                    // Synchronous wait for the HTTP call to complete
-                    var doneEvent = new ManualResetEventSlim(false);
+                    // Synchronous HTTP call — blocks worker thread until response
+                    var result = HttpEngine.PostChatCompletionSync(
+                        request.Messages, request.Options);
 
-                    HttpEngine.PostChatCompletion(request.Messages, request.Options, result =>
+                    result.wasThrottled = wasThrottled;
+                    ModRegistry.RecordRequest(request.Mod);
+
+                    // Track duration for throttle calculations
+                    lock (_recentDurations)
                     {
-                        result.wasThrottled = wasThrottled;
-                        ModRegistry.RecordRequest(request.Mod);
-
-                        // Track duration for throttle calculations
-                        lock (_recentDurations)
-                        {
-                            _recentDurations.Add(result.durationMs);
-                            if (_recentDurations.Count > 20)
-                                _recentDurations.RemoveAt(0);
-                        }
-
-                        request.Callback?.Invoke(result);
-                        doneEvent.Set();
-                    });
-
-                    // Wait for completion (with timeout)
-                    int timeoutMs = (settings?.timeoutSeconds ?? 120) * 1000 + 5000;
-                    if (!doneEvent.Wait(timeoutMs))
-                    {
-                        SynapseLog.Error("queue", "Request timed out in queue worker.",
-                            request.Mod?.ModId);
-                        SynapseGameComponent.Enqueue(() =>
-                            request.Callback?.Invoke(
-                                ChatResult.Failure("Request timed out.")));
+                        _recentDurations.Add(result.durationMs);
+                        if (_recentDurations.Count > 20)
+                            _recentDurations.RemoveAt(0);
                     }
+
+                    // Dispatch user callback to main thread
+                    var cb = request.Callback;
+                    SynapseGameComponent.Enqueue(() => cb?.Invoke(result));
                 }
                 catch (Exception ex)
                 {
                     SynapseLog.Error("queue", $"Queue worker error: {ex.Message}",
                         request.Mod?.ModId);
+                    var cb = request.Callback;
                     SynapseGameComponent.Enqueue(() =>
-                        request.Callback?.Invoke(
-                            ChatResult.Failure($"Queue error: {ex.Message}")));
+                        cb?.Invoke(ChatResult.Failure($"Queue error: {ex.Message}")));
                 }
                 finally
                 {

@@ -27,10 +27,12 @@ namespace RimSynapse
         }
 
         /// <summary>
-        /// Called when a game is loaded. Starts background services.
-        /// Triggered by <see cref="SynapseGameComponent.FinalizeInit"/>.
+        /// Initialize all background services.
+        /// Called from RimSynapseMod constructor — runs on mod load, NOT
+        /// on game load, so keep-alive and model discovery work even on
+        /// the main menu.
         /// </summary>
-        internal static void OnGameLoaded()
+        internal static void Initialize()
         {
             if (_initialized) return;
             _initialized = true;
@@ -38,9 +40,11 @@ namespace RimSynapse
             HttpEngine.EnsureInitialized();
             KeepAlive.Start();
 
-            // Initial model check
-            ModelManager.GetModels(result =>
+            // Initial model check on a background thread
+            System.Threading.Tasks.Task.Run(() =>
             {
+                var result = HttpEngine.GetModelsSync();
+
                 if (result.online)
                 {
                     SynapseLog.Info("core",

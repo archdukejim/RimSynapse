@@ -17,6 +17,13 @@ namespace RimSynapse
         /// <summary>Enable response sanitization (strip think blocks, repair JSON). Default: true.</summary>
         public bool sanitize = true;
 
+        /// <summary>
+        /// Enable model thinking/reasoning. Null = use global setting,
+        /// true = force thinking on, false = force thinking off.
+        /// Disabling thinking saves tokens and reduces latency.
+        /// </summary>
+        public bool? thinking;
+
         /// <summary>Request priority. 0 = normal, higher = processed sooner within mod's budget.</summary>
         public int priority;
 

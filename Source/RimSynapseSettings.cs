@@ -14,8 +14,10 @@ namespace RimSynapse
 
         // --- Behavior ---
         public bool autoMapModel = true;
+        public string selectedModel = "";
         public bool sanitizeResponse = true;
         public bool enableKeepAlive = true;
+        public bool disableThinking = true;
 
         // --- Performance ---
         public int timeoutSeconds = 120;
@@ -30,8 +32,10 @@ namespace RimSynapse
             Scribe_Values.Look(ref lmStudioUrl, "lmStudioUrl", "http://127.0.0.1:1234");
             Scribe_Values.Look(ref lmStudioApiKey, "lmStudioApiKey", "");
             Scribe_Values.Look(ref autoMapModel, "autoMapModel", true);
+            Scribe_Values.Look(ref selectedModel, "selectedModel", "");
             Scribe_Values.Look(ref sanitizeResponse, "sanitizeResponse", true);
             Scribe_Values.Look(ref enableKeepAlive, "enableKeepAlive", true);
+            Scribe_Values.Look(ref disableThinking, "disableThinking", true);
             Scribe_Values.Look(ref timeoutSeconds, "timeoutSeconds", 120);
             Scribe_Values.Look(ref maxRequestsPerMinute, "maxRequestsPerMinute", 30);
             Scribe_Values.Look(ref logLevel, "logLevel", LogLevel.Info);

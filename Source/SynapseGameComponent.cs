@@ -49,12 +49,13 @@ namespace RimSynapse
         }
 
         /// <summary>
-        /// Called when the game is loaded. Triggers Core startup.
+        /// Called when a game is loaded.
+        /// Background services are already running (started in mod constructor).
         /// </summary>
         public override void FinalizeInit()
         {
             base.FinalizeInit();
-            SynapseCore.OnGameLoaded();
+            SynapseLog.Debug("core", "Game loaded. Main-thread dispatcher active.");
         }
     }
 }

@@ -24,22 +24,36 @@ namespace RimSynapse.Internal
         /// <summary>Whether LM Studio was reachable on the last check.</summary>
         internal static bool IsOnline => _cachedResult?.online ?? false;
 
+        /// <summary>Cached model IDs from the last successful fetch.</summary>
+        internal static List<string> CachedModelIds =>
+            _cachedResult?.modelIds ?? new List<string>();
+
         /// <summary>
         /// Get the model ID to use for a request. If autoMapModel is enabled and
         /// no specific model is requested, returns the first loaded model.
         /// </summary>
         internal static string ResolveModel(string requestedModel)
         {
+            // Explicit per-request model takes priority
             if (!string.IsNullOrEmpty(requestedModel))
                 return requestedModel;
 
             var settings = RimSynapseMod.Instance?.Settings;
-            if (settings == null || !settings.autoMapModel)
+            if (settings == null)
                 return requestedModel;
 
-            // Use cached active model
-            if (!string.IsNullOrEmpty(ActiveModel))
-                return ActiveModel;
+            if (settings.autoMapModel)
+            {
+                // Auto-map: use first loaded model
+                if (!string.IsNullOrEmpty(ActiveModel))
+                    return ActiveModel;
+            }
+            else
+            {
+                // Manual: use user-selected model
+                if (!string.IsNullOrEmpty(settings.selectedModel))
+                    return settings.selectedModel;
+            }
 
             return requestedModel;
         }
@@ -60,8 +74,10 @@ namespace RimSynapse.Internal
                 }
             }
 
-            HttpEngine.GetModels(result =>
+            System.Threading.Tasks.Task.Run(() =>
             {
+                var result = HttpEngine.GetModelsSync();
+
                 lock (_cacheLock)
                 {
                     _cachedResult = result;
@@ -89,7 +105,7 @@ namespace RimSynapse.Internal
                     }
                 }
 
-                callback(result);
+                SynapseGameComponent.Enqueue(() => callback(result));
             });
         }
 
