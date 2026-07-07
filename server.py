@@ -1599,21 +1599,59 @@ def api_template_delete(template_id):
 
 @app.route('/api/prompt/fill', methods=['POST'])
 def api_prompt_fill():
-    """Fill a registered template with slot values. Efficient for repeated calls."""
+    """Fill a registered template with slot values. Efficient for repeated calls.
+
+    Accepts optional 'mode' in request body:
+      - "production" (default): logs prompt summary + LLM response
+      - "verbose": logs handshake points (template found, slots filled, etc.)
+      - "debug": logs everything including raw payloads
+    """
     try:
         data = request.get_json()
+        mode = data.get("mode", "production")
+
+        if mode == "debug":
+            log_to_dashboard('info', 'prompt',
+                f"[DEBUG] Fill request received: {json.dumps(data, default=str)}")
+
+        if mode in ("debug", "verbose"):
+            log_to_dashboard('info', 'prompt',
+                f"[HANDSHAKE] Template lookup: '{data.get('template_id')}'")
+
         result = fill_template(data)
         if "error" in result:
+            log_to_dashboard('warn', 'prompt',
+                f"Fill rejected: {result['error']}")
             return jsonify(result), 400
 
         # Track for dashboard
         session_stats["context_calls"] += 1
         session_stats["total_tokens_estimated"] += result.get("tokens_estimated", 0)
 
-        log_to_dashboard('info', 'prompt',
-            f"Template filled: {result['template_id']} -> "
-            f"~{result['tokens_estimated']} tokens, "
-            f"{len(result.get('slots_dropped', []))} slots dropped")
+        if mode == "debug":
+            log_to_dashboard('info', 'prompt',
+                f"[DEBUG] Template matched: {result['template_id']} "
+                f"(mod: {result.get('mod_id', '?')})")
+            log_to_dashboard('info', 'prompt',
+                f"[DEBUG] Slots filled: {result['slots_filled']}")
+            if result.get('slots_dropped'):
+                log_to_dashboard('info', 'prompt',
+                    f"[DEBUG] Slots dropped (low weight): {result['slots_dropped']}")
+            log_to_dashboard('info', 'prompt',
+                f"[DEBUG] Final prompt ({result['tokens_estimated']} tokens):\n"
+                f"{result['prompt']}")
+        elif mode == "verbose":
+            log_to_dashboard('info', 'prompt',
+                f"[HANDSHAKE] Template '{result['template_id']}' filled -> "
+                f"{len(result['slots_filled'])} slots, "
+                f"{len(result.get('slots_dropped', []))} dropped")
+            log_to_dashboard('info', 'prompt',
+                f"[HANDSHAKE] Prompt assembled: ~{result['tokens_estimated']} tokens")
+        else:  # production
+            log_to_dashboard('info', 'prompt',
+                f"Prompt: {result['template_id']} -> "
+                f"~{result['tokens_estimated']} tokens")
+
         return jsonify(result)
     except Exception as e:
         log_to_dashboard('error', 'prompt', f"Template fill error: {e}")
@@ -1624,21 +1662,49 @@ def api_prompt_fill():
 
 @app.route('/api/prompt/raw', methods=['POST'])
 def api_prompt_raw():
-    """Send a complete prompt or context packet. The bridge just packages it."""
+    """Send a complete prompt or context packet. The bridge just packages it.
+
+    Accepts optional 'mode' in request body:
+      - "production" (default): logs token estimate only
+      - "verbose": logs format detected + token estimate
+      - "debug": logs full raw payload
+    """
     try:
         data = request.get_json()
+        mode = data.get("mode", "production")
+
+        if mode == "debug":
+            log_to_dashboard('info', 'prompt',
+                f"[DEBUG] Raw request received: {json.dumps(data, default=str)}")
+
         result = build_raw_prompt(data)
 
         # Track for dashboard
         session_stats["context_calls"] += 1
         session_stats["total_tokens_estimated"] += result.get("tokens_estimated", 0)
 
-        log_to_dashboard('info', 'prompt',
-            f"Raw prompt: ~{result['tokens_estimated']} tokens")
+        if mode == "debug":
+            log_to_dashboard('info', 'prompt',
+                f"[DEBUG] Raw prompt ({result['tokens_estimated']} tokens):\n"
+                f"{result['prompt']}")
+            if result.get("messages"):
+                log_to_dashboard('info', 'prompt',
+                    f"[DEBUG] Messages: {json.dumps(result['messages'], default=str)}")
+        elif mode == "verbose":
+            log_to_dashboard('info', 'prompt',
+                f"[HANDSHAKE] Raw prompt packaged: "
+                f"mode={result.get('mode', '?')}, "
+                f"~{result['tokens_estimated']} tokens, "
+                f"{len(result.get('messages', []))} messages")
+        else:  # production
+            log_to_dashboard('info', 'prompt',
+                f"Raw prompt: ~{result['tokens_estimated']} tokens")
+
         return jsonify(result)
     except Exception as e:
         log_to_dashboard('error', 'prompt', f"Raw prompt error: {e}")
         return jsonify({'error': str(e)}), 500
+
 
 
 # --- Dashboard Stats ---
