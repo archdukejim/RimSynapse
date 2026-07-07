@@ -35,13 +35,17 @@
             <HintPath>$(HarmonyPath)\0Harmony.dll</HintPath>
             <Private>false</Private>
         </Reference>
-        <Reference Include="Newtonsoft.Json">
-            <HintPath>$(RimWorldPath)\RimWorldWin64_Data\Managed\Newtonsoft.Json.dll</HintPath>
-            <Private>false</Private>
-        </Reference>
-
         <!-- System.Net.Http for HttpClient -->
         <Reference Include="System.Net.Http" />
+    </ItemGroup>
+
+    <!-- NuGet packages: Newtonsoft.Json is not in RimWorld's Managed folder -->
+    <ItemGroup>
+        <PackageReference Include="Newtonsoft.Json" Version="13.0.3">
+            <PrivateAssets>all</PrivateAssets>
+            <!-- Not copied to output — many RimWorld mods ship their own; 
+                 we'll include it in our Assemblies/ if no other mod provides it -->
+        </PackageReference>
     </ItemGroup>
 
 </Project>

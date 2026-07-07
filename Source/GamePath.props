@@ -11,6 +11,8 @@
 <Project>
     <PropertyGroup>
         <RimWorldPath>C:\Program Files (x86)\Steam\steamapps\common\RimWorld</RimWorldPath>
-        <HarmonyPath>$(RimWorldPath)\Mods\Harmony\Current\Assemblies</HarmonyPath>
+        <SteamWorkshopPath>C:\Program Files (x86)\Steam\steamapps\workshop\content\294100</SteamWorkshopPath>
+        <!-- Harmony Steam Workshop ID: 2009463077 -->
+        <HarmonyPath>$(SteamWorkshopPath)\2009463077\Current\Assemblies</HarmonyPath>
     </PropertyGroup>
 </Project>
